@@ -1,0 +1,2509 @@
+import datetime
+import hashlib
+import html
+import json
+import math
+import random
+import re
+import time
+from threading import Thread
+from typing import Any, List
+
+from android.graphics.drawable import GradientDrawable
+from android.media import ExifInterface
+from android.os import Handler, Looper
+from android.util import TypedValue
+from android.view import Gravity, MotionEvent, View, ViewGroup
+from android.widget import Button, EditText, FrameLayout, LinearLayout, ScrollView, TextView, Toast
+from androidx.recyclerview.widget import RecyclerView
+from java import dynamic_proxy, jint
+from java.io import BufferedReader, File, FileOutputStream, InputStreamReader
+from java.lang import String, System
+from java.net import HttpURLConnection, InetSocketAddress, Socket, URL
+from java.util import ArrayList
+from org.json import JSONObject
+from org.telegram.messenger import AndroidUtilities, MediaController, MessagesController, UserObject
+from org.telegram.ui import ChatActivity, LaunchActivity
+from org.telegram.ui.ActionBar import Theme
+
+from android_utils import R, log, run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, MenuItemData, MenuItemType
+from client_utils import get_last_fragment, send_text
+from ui.settings import Divider, Header, Selector, Switch, Text
+
+try:
+    from org.telegram.ui.Cells import ChatMessageCell
+except Exception:
+    ChatMessageCell = None
+
+__id__ = "exter_suite_plus"
+__name__ = "ExterGram Suite+"
+__description__ = (
+    "Комбайн для ExterGram: валюта, пинг, таймеры, дни рождения, экспорт чатов, "
+    "очистка избранного, снятие EXIF/GPS, кастомная FAB, бесконечная прокрутка папок, "
+    "прочитать всё, отключение автопроигрывания, proxy/exitFy, паника-пароль."
+)
+__author__ = "@Ryzendd"
+__version__ = "1.0"
+__icon__ = "msg_photo_settings"
+
+PREFIX = "."
+REPLY_MARK = "[Suite]"
+FAB_DP = 54
+PANEL_DP = 300
+MAX_EXPORT_HARD = 5000
+
+EXPORT_LIMIT_ITEMS = ["500", "1000", "2000", "5000"]
+EXPORT_LIMITS = [500, 1000, 2000, 5000]
+
+REMIND_ITEMS = ["Не напоминать", "Только сегодня", "За 1 день", "За 3 дня", "За 7 дней"]
+REMIND_DAYS = [-1, 0, 1, 3, 7]
+
+STATUS_ITEMS = ["2 сек", "3 сек", "5 сек", "10 сек"]
+STATUS_SECONDS = [2, 3, 5, 10]
+
+FALLBACK_RATES = {
+    "USD": 1.0,
+    "EUR": 0.92,
+    "RUB": 95.0,
+    "UAH": 41.0,
+    "KZT": 450.0,
+    "BYN": 3.2,
+    "GBP": 0.79,
+    "CNY": 7.25,
+    "TRY": 32.0,
+    "INR": 83.0,
+}
+
+EXIF_TAG_NAMES = (
+    "TAG_GPS_LATITUDE",
+    "TAG_GPS_LATITUDE_REF",
+    "TAG_GPS_LONGITUDE",
+    "TAG_GPS_LONGITUDE_REF",
+    "TAG_GPS_ALTITUDE",
+    "TAG_GPS_ALTITUDE_REF",
+    "TAG_GPS_TIMESTAMP",
+    "TAG_GPS_DATESTAMP",
+    "TAG_GPS_PROCESSING_METHOD",
+    "TAG_GPS_SATELLITES",
+    "TAG_GPS_SPEED",
+    "TAG_GPS_SPEED_REF",
+    "TAG_GPS_TRACK",
+    "TAG_GPS_TRACK_REF",
+    "TAG_IMG_DIRECTION",
+    "TAG_IMG_DIRECTION_REF",
+    "TAG_MAP_DATUM",
+    "TAG_MAKE",
+    "TAG_MODEL",
+    "TAG_SOFTWARE",
+    "TAG_ARTIST",
+    "TAG_COPYRIGHT",
+    "TAG_IMAGE_DESCRIPTION",
+    "TAG_USER_COMMENT",
+    "TAG_X_POSITION",
+    "TAG_Y_POSITION",
+)
+
+EXIF_TAGS = []
+if ExifInterface is not None:
+    for _tag_name in EXIF_TAG_NAMES:
+        _tag_value = getattr(ExifInterface, _tag_name, None)
+        if _tag_value is not None:
+            EXIF_TAGS.append(_tag_value)
+
+WIPE_KEYS = [
+    "show_fab", "commands", "commands_saved_only", "haptics", "status_idx",
+    "currency_fetch", "currency_from", "currency_to", "ping_host",
+    "timers_enabled", "timer_send_chat", "remind_idx", "birthday_send_chat",
+    "export_idx", "saved_allow_delete", "strip_metadata", "endless_scroll",
+    "no_autoplay", "proxy_enable", "exit_auto_use", "panic_enabled", "lock_on_start",
+    "fab_x", "fab_y", "rates_json", "rates_time",
+    "timers", "timer_seq", "birthdays", "birthday_seq",
+    "proxy_cfg", "exit_list", "pass_hash", "panic_hash", "pass_salt",
+]
+
+HELP_TEXT = (
+    "Команды:\n"
+    ".help — справка\n"
+    ".cr 100 USD RUB — конвертация\n"
+    ".ping [host] [port] [count] — проверка задержки\n"
+    ".timer 10m Название — таймер\n"
+    ".timers / .cancel ID — список/отмена\n"
+    ".bday add Имя 31.12 / .bday list / .bday next / .bday del ID\n"
+    ".export html|json|txt — экспорт текущего чата\n"
+    ".cleansaved [delete] — поиск/удаление дубликатов в Избранном\n"
+    ".readall — попробовать отметить всё прочитанным\n"
+    ".autoplay on|off — запретить/разрешить автопроигрывание\n"
+    ".endless on|off — бесконечная прокрутка списков/папок\n"
+    ".proxy on|off|status|set type host port [user pass]\n"
+    ".exit add Name [type] host port [user pass] / .exit list / .exit use N / .exit ping\n"
+    ".pass set **** / .pass off / .panic set **** / .lock\n"
+    "Секреты лучше задавать только в Избранном."
+)
+
+
+def as_java_color(color: int) -> int:
+    value = int(color) & 0xFFFFFFFF
+    return value - 0x100000000 if value >= 0x80000000 else value
+
+
+def clamp(value, lo, hi):
+    if hi < lo:
+        return lo
+    return lo if value < lo else hi if value > hi else value
+
+
+def parse_duration(text: str):
+    m = re.fullmatch(r"(\d+)([smhd])", str(text).strip().lower())
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2)
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(unit, 0)
+    return n * mult if mult else None
+
+
+def normalize_text(s: str) -> str:
+    s = str(s or "").lower()
+    s = re.sub(r"[^\w\s]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+class _OnClickListener(dynamic_proxy(View.OnClickListener)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onClick(self, view):
+        try:
+            self.fn()
+        except Exception as e:
+            log(f"[{__id__}] click error: {e}")
+
+
+class _FabTouchListener(dynamic_proxy(View.OnTouchListener)):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def onTouch(self, view, event):
+        try:
+            return bool(self.plugin._on_fab_touch(event))
+        except Exception as e:
+            log(f"[{__id__}] fab touch error: {e}")
+            return False
+
+
+class ExterSuitePlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._handler = None
+        self._tick_r = None
+        self._running = False
+        self._paused = False
+        self._unloaded = False
+        self._cfg = {}
+
+        self._decor = None
+        self._fab = None
+        self._status = None
+        self._panel = None
+        self._panel_log = None
+        self._panel_listeners = []
+        self._lock = None
+        self._lock_input = None
+        self._lock_listeners = []
+        self._fab_touch = None
+
+        self._reset_state()
+
+    def on_plugin_load(self):
+        self._reload_cfg()
+        self._handler = Handler(Looper.getMainLooper())
+        self._tick_r = R(self._tick)
+
+        self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.DRAWER_MENU,
+                text="Exter Suite",
+                on_click=self._on_menu_toggle,
+                item_id="exter_suite_toggle",
+                icon="msg_photo_settings",
+            )
+        )
+        self.add_on_send_message_hook()
+        run_on_ui_thread(lambda: self._start(greet=True))
+
+    def on_plugin_unload(self):
+        self._unloaded = True
+        self._running = False
+        if self._handler is not None and self._tick_r is not None:
+            self._handler.removeCallbacks(self._tick_r)
+        self._on_ui(self._detach_views)
+
+    def on_app_event(self, event_type):
+        if event_type == "PAUSE":
+            self._paused = True
+            if self._handler is not None and self._tick_r is not None:
+                self._handler.removeCallbacks(self._tick_r)
+        elif event_type == "RESUME":
+            self._paused = False
+            run_on_ui_thread(lambda: self._start(greet=False))
+
+    def on_send_message_hook(self, account, params):
+        try:
+            text = str(getattr(params, "message", "") or "")
+            if text and not text.startswith(REPLY_MARK):
+                if self._cfg.get("commands", True) and text.startswith(PREFIX):
+                    self._handle_command(account, text)
+                if self._cfg.get("strip_metadata", True):
+                    self._strip_params(params)
+        except Exception as e:
+            log(f"[{__id__}] send hook error: {e}")
+        return HookResult()
+
+    def create_settings(self) -> List[Any]:
+        currency_from = str(self.get_setting("currency_from", "USD") or "USD").upper()
+        currency_to = str(self.get_setting("currency_to", "RUB") or "RUB").upper()
+        ping_host = str(self.get_setting("ping_host", "1.1.1.1") or "1.1.1.1")
+        proxy_cfg = self._load_json("proxy_cfg", {})
+        proxy_status = "вкл" if proxy_cfg.get("enabled") else "выкл"
+        pass_set = bool(str(self.get_setting("pass_hash", "") or ""))
+        panic_set = bool(str(self.get_setting("panic_hash", "") or ""))
+
+        return [
+            Header(text="Основное"),
+            Switch(
+                key="show_fab",
+                text="Кастомная кнопка Suite",
+                default=True,
+                subtext="Плавающая кнопка 🧰 с быстрым доступом",
+                icon="msg_photo_settings",
+                on_change=lambda v: self._on_cfg_change("show_fab", v),
+            ),
+            Switch(
+                key="commands",
+                text="Обрабатывать команды",
+                default=True,
+                subtext="Команды вида .ping, .cr, .timer и т.д.",
+                icon="msg_discussion",
+                on_change=lambda v: self._on_cfg_change("commands", v),
+            ),
+            Switch(
+                key="commands_saved_only",
+                text="Команды только в Избранном",
+                default=False,
+                subtext="Защита от случайных команд в рабочих чатах",
+                icon="msg_mute",
+                on_change=lambda v: self._on_cfg_change("commands_saved_only", v),
+            ),
+            Switch(
+                key="haptics",
+                text="Вибрация",
+                default=True,
+                icon="msg_sticker",
+                on_change=lambda v: self._on_cfg_change("haptics", v),
+            ),
+            Selector(
+                key="status_idx",
+                text="Длина всплывающих сообщений",
+                default=1,
+                items=STATUS_ITEMS,
+                icon="msg_discussion",
+                on_change=lambda v: self._on_cfg_change("status_idx", v),
+            ),
+
+            Divider(),
+            Header(text="Конвертер валют"),
+            Switch(
+                key="currency_fetch",
+                text="Онлайн-курсы",
+                default=True,
+                subtext="Использовать открытый курс USD-базы; при ошибке — кэш/fallback",
+                icon="msg_download",
+                on_change=lambda v: self._on_cfg_change("currency_fetch", v),
+            ),
+            Text(
+                text="Текущая пара",
+                subtext=f"{currency_from} → {currency_to}",
+                icon="msg_colors",
+            ),
+            Text(
+                text="Пример команды",
+                subtext=".cr 100 USD RUB",
+                icon="msg_edit",
+            ),
+            Text(
+                text="Быстрый пинг курса",
+                icon="msg_retry",
+                accent=True,
+                on_click=lambda _view=None: run_on_ui_thread(self._action_currency),
+            ),
+
+            Divider(),
+            Header(text="Пинг-чекер"),
+            Text(
+                text="Хост по умолчанию",
+                subtext=ping_host,
+                icon="msg_location",
+            ),
+            Text(
+                text="Проверить пинг",
+                icon="msg_retry",
+                accent=True,
+                on_click=lambda _view=None: run_on_ui_thread(self._action_ping),
+            ),
+
+            Divider(),
+            Header(text="Таймеры и дни рождения"),
+            Switch(
+                key="timers_enabled",
+                text="Таймеры",
+                default=True,
+                subtext=".timer 10m Выпить воды",
+                icon="msg_timer",
+                on_change=lambda v: self._on_cfg_change("timers_enabled", v),
+            ),
+            Switch(
+                key="timer_send_chat",
+                text="Писать напоминание в текущий чат",
+                default=False,
+                icon="msg_send",
+                on_change=lambda v: self._on_cfg_change("timer_send_chat", v),
+            ),
+            Selector(
+                key="remind_idx",
+                text="Напоминание о ДР",
+                default=3,
+                items=REMIND_ITEMS,
+                icon="msg_emoji_cat",
+                on_change=lambda v: self._on_cfg_change("remind_idx", v),
+            ),
+            Switch(
+                key="birthday_send_chat",
+                text="Писать ДР в текущий чат",
+                default=False,
+                icon="msg_send",
+                on_change=lambda v: self._on_cfg_change("birthday_send_chat", v),
+            ),
+            Text(
+                text="Список таймеров",
+                icon="msg_timer",
+                on_click=lambda _view=None: run_on_ui_thread(self._action_timers),
+            ),
+            Text(
+                text="Список дней рождения",
+                icon="msg_emoji_cat",
+                on_click=lambda _view=None: run_on_ui_thread(self._action_birthdays),
+            ),
+
+            Divider(),
+            Header(text="Экспорт и Избранное"),
+            Selector(
+                key="export_idx",
+                text="Формат экспорта",
+                default=0,
+                items=["HTML", "JSON", "TXT"],
+                icon="msg_send",
+                on_change=lambda v: self._on_cfg_change("export_idx", v),
+            ),
+            Text(
+                text="Экспортировать текущий чат",
+                subtext="Сохраняет файл во внутренние файлы приложения",
+                icon="msg_retry",
+                accent=True,
+                on_click=lambda _view=None: run_on_ui_thread(self._action_export),
+            ),
+            Switch(
+                key="saved_allow_delete",
+                text="Разрешить удаление дубликатов",
+                default=False,
+                subtext="Осторожно: команда .cleansaved delete будет удалять сообщения в Избранном",
+                icon="msg_delete",
+                on_change=lambda v: self._on_cfg_change("saved_allow_delete", v),
+            ),
+            Text(
+                text="Проверить Избранное на дубликаты",
+                icon="msg_stats",
+                on_click=lambda _view=None: run_on_ui_thread(self._action_scan_saved),
+            ),
+            Text(
+                text="Удалить найденные дубликаты",
+                icon="msg_delete",
+                on_click=lambda _view=None: run_on_ui_thread(self._action_delete_dupes),
+            ),
+
+            Divider(),
+            Header(text="Медиа и интерфейс"),
+            Switch(
+                key="strip_metadata",
+                text="Снимать EXIF/GPS с исходящих фото",
+                default=True,
+                subtext="Best-effort: зависит от того, какие пути доступны в hook-параметрах",
+                icon="msg_clear",
+                on_change=lambda v: self._on_cfg_change("strip_metadata", v),
+            ),
+            Switch(
+                key="no_autoplay",
+                text="Отключить автопроигрывание",
+                default=False,
+                subtext="Пытается выставить настройки и остановить текущее воспроизведение",
+                icon="msg_voice_headphones",
+                on_change=lambda v: self._on_cfg_change("no_autoplay", v),
+            ),
+            Switch(
+                key="endless_scroll",
+                text="Бесконечная прокрутка папок/списков",
+                default=False,
+                subtext="Автодоскролл нижних элементов в списках диалогов/папок",
+                icon="msg_download",
+                on_change=lambda v: self._on_cfg_change("endless_scroll", v),
+            ),
+            Text(
+                text="Прочитать всё",
+                icon="msg_discussion",
+                accent=True,
+                on_click=lambda _view=None: run_on_ui_thread(self._action_read_all),
+            ),
+
+            Divider(),
+            Header(text="Сеть, proxy, exitFy"),
+            Switch(
+                key="proxy_enable",
+                text="Включить сохранённый proxy",
+                default=bool(proxy_cfg.get("enabled", False)),
+                subtext=f"Статус: {proxy_status}. Применяется к Java-сетям best-effort.",
+                icon="msg_notifications",
+                on_change=lambda v: self._on_cfg_change("proxy_enable", v),
+            ),
+            Switch(
+                key="exit_auto_use",
+                text="Автовыбор быстрого exit",
+                default=False,
+                subtext="После .exit ping использовать минимальную задержку",
+                icon="msg_retry",
+                on_change=lambda v: self._on_cfg_change("exit_auto_use", v),
+            ),
+            Text(
+                text="Статус proxy",
+                icon="msg_location",
+                on_click=lambda _view=None: run_on_ui_thread(self._action_proxy_status),
+            ),
+
+            Divider(),
+            Header(text="Паника-безопасность"),
+            Switch(
+                key="panic_enabled",
+                text="Паника-код",
+                default=True,
+                subtext="Паника-код очищает только данные плагина",
+                icon="msg_clear",
+                on_change=lambda v: self._on_cfg_change("panic_enabled", v),
+            ),
+            Switch(
+                key="lock_on_start",
+                text="Блокировать при запуске",
+                default=False,
+                subtext="Если установлен .pass",
+                icon="msg_mute",
+                on_change=lambda v: self._on_cfg_change("lock_on_start", v),
+            ),
+            Text(
+                text="Пароль",
+                subtext="установлен" if pass_set else "не задан (.pass set ****)",
+                icon="msg_sticker",
+            ),
+            Text(
+                text="Паника-код",
+                subtext="установлен" if panic_set else "не задан (.panic set ****)",
+                icon="msg_delete",
+            ),
+            Text(
+                text="Заблокировать сейчас",
+                icon="msg_mute",
+                accent=True,
+                on_click=lambda _view=None: run_on_ui_thread(self._action_lock),
+            ),
+
+            Divider(),
+            Text(
+                text="Открыть панель Suite",
+                icon="msg_photo_settings",
+                accent=True,
+                on_click=lambda _view=None: run_on_ui_thread(self._open_panel),
+            ),
+            Text(
+                text="Справка по командам",
+                icon="msg_discussion",
+                on_click=lambda _view=None: run_on_ui_thread(self._action_help),
+            ),
+            Divider(
+                text="Экспериментальный плагин. Перед использованием удалённых действий "
+                     "сделайте резервную копию/проверьте на втором аккаунте."
+            ),
+        ]
+
+    def _reload_cfg(self):
+        self._cfg = {
+            "show_fab": bool(self.get_setting("show_fab", True)),
+            "commands": bool(self.get_setting("commands", True)),
+            "commands_saved_only": bool(self.get_setting("commands_saved_only", False)),
+            "haptics": bool(self.get_setting("haptics", True)),
+            "status_idx": int(self.get_setting("status_idx", 1) or 0),
+            "currency_fetch": bool(self.get_setting("currency_fetch", True)),
+            "currency_from": str(self.get_setting("currency_from", "USD") or "USD").upper(),
+            "currency_to": str(self.get_setting("currency_to", "RUB") or "RUB").upper(),
+            "ping_host": str(self.get_setting("ping_host", "1.1.1.1") or "1.1.1.1"),
+            "timers_enabled": bool(self.get_setting("timers_enabled", True)),
+            "timer_send_chat": bool(self.get_setting("timer_send_chat", False)),
+            "remind_idx": int(self.get_setting("remind_idx", 3) or 0),
+            "birthday_send_chat": bool(self.get_setting("birthday_send_chat", False)),
+            "export_idx": int(self.get_setting("export_idx", 0) or 0),
+            "saved_allow_delete": bool(self.get_setting("saved_allow_delete", False)),
+            "strip_metadata": bool(self.get_setting("strip_metadata", True)),
+            "endless_scroll": bool(self.get_setting("endless_scroll", False)),
+            "no_autoplay": bool(self.get_setting("no_autoplay", False)),
+            "proxy_enable": bool(self.get_setting("proxy_enable", False)),
+            "exit_auto_use": bool(self.get_setting("exit_auto_use", False)),
+            "panic_enabled": bool(self.get_setting("panic_enabled", True)),
+            "lock_on_start": bool(self.get_setting("lock_on_start", False)),
+        }
+
+    def _on_cfg_change(self, key, value):
+        self._cfg[key] = value
+        self._set_setting(key, value)
+        if key == "show_fab":
+            run_on_ui_thread(self._apply_show_fab)
+        elif key == "no_autoplay":
+            run_on_ui_thread(self._apply_autoplay)
+        elif key == "proxy_enable":
+            cfg = self._load_json("proxy_cfg", {})
+            cfg["enabled"] = bool(value)
+            self._save_json("proxy_cfg", cfg)
+            run_on_ui_thread(self._apply_proxy_settings)
+        elif key == "lock_on_start" and value and self._has_pass():
+            run_on_ui_thread(self._show_lock)
+
+    def _on_menu_toggle(self, context=None):
+        show = not self._cfg.get("show_fab", True)
+        self._cfg["show_fab"] = show
+        self._set_setting("show_fab", show)
+        run_on_ui_thread(self._apply_show_fab)
+
+    def _apply_show_fab(self):
+        if self._fab is None:
+            self._ensure_attached(force=True)
+        if self._fab is None:
+            return
+        visible = bool(self._cfg.get("show_fab", True))
+        self._fab.setVisibility(View.VISIBLE if visible else View.GONE)
+        if not visible:
+            self._close_panel()
+
+    def _on_ui(self, fn):
+        try:
+            if Looper.myLooper() == Looper.getMainLooper():
+                fn()
+                return
+        except Exception:
+            pass
+        run_on_ui_thread(fn)
+
+    def _set_setting(self, key, value):
+        try:
+            self.set_setting(key, value)
+        except Exception as e:
+            log(f"[{__id__}] set_setting {key}: {e}")
+
+    def _load_json(self, key, default):
+        try:
+            raw = str(self.get_setting(key, "") or "")
+            if not raw:
+                return default
+            return json.loads(raw)
+        except Exception:
+            return default
+
+    def _save_json(self, key, obj):
+        try:
+            self._set_setting(key, json.dumps(obj, ensure_ascii=False))
+        except Exception as e:
+            log(f"[{__id__}] save_json {key}: {e}")
+
+    def _start(self, greet):
+        if self._unloaded or self._paused:
+            return
+        self._running = True
+        self._last_tick = time.monotonic()
+        self._ensure_attached(force=bool(self._cfg.get("show_fab", True)))
+        self._apply_show_fab()
+        self._apply_proxy_settings()
+        if self._cfg.get("no_autoplay", False):
+            self._apply_autoplay()
+        if self._cfg.get("lock_on_start", False) and self._has_pass():
+            self._show_lock()
+        if greet:
+            self._show_status("Exter Suite активен. .help")
+        self._schedule(120)
+
+    def _schedule(self, delay):
+        if self._handler is None or self._tick_r is None:
+            return
+        self._handler.removeCallbacks(self._tick_r)
+        self._handler.postDelayed(self._tick_r, int(delay))
+
+    def _post(self, fn, delay_ms=0):
+        if self._handler is None or self._unloaded:
+            return
+        try:
+            self._handler.postDelayed(R(fn), int(max(0, delay_ms)))
+        except Exception as e:
+            log(f"[{__id__}] post error: {e}")
+
+    def _tick(self):
+        if not self._running or self._paused:
+            return
+        try:
+            self._step()
+        except Exception as e:
+            log(f"[{__id__}] tick error: {e}")
+        if self._running and not self._paused:
+            self._schedule(self._next_delay())
+
+    def _next_delay(self):
+        if self._locked or self._panel_open:
+            return 50
+        if self._status is not None and self._status.getVisibility() == View.VISIBLE:
+            return 100
+        if self._cfg.get("endless_scroll", False):
+            return 120
+        if self._cfg.get("timers_enabled", True):
+            return 250
+        return 500
+
+    def _reset_state(self):
+        now = time.monotonic()
+        self._last_tick = now
+        self._status_gen = 0
+        self._panel_open = False
+        self._locked = False
+        self._fab_placed = False
+        self._touch = None
+        self._next_timer_check = 0.0
+        self._next_endless = 0.0
+        self._next_autoplay_check = 0.0
+        self._wrong_unlocks = 0
+
+    def _current_activity(self):
+        activity = None
+        try:
+            activity = LaunchActivity.instance
+        except Exception:
+            activity = None
+        if activity is None:
+            try:
+                fragment = get_last_fragment()
+                activity = fragment.getParentActivity() if fragment is not None else None
+            except Exception:
+                activity = None
+        return activity
+
+    def _context(self):
+        try:
+            ctx = LaunchActivity.instance
+            if ctx is not None:
+                return ctx
+        except Exception:
+            pass
+        return self._current_activity()
+
+    def _ensure_attached(self, force=False):
+        if self._unloaded:
+            return
+        if not force and not self._cfg.get("show_fab", True) and self._panel is None and self._lock is None:
+            return
+        activity = self._current_activity()
+        if activity is None:
+            return
+        try:
+            decor = activity.getWindow().getDecorView()
+        except Exception:
+            return
+        if decor is None:
+            return
+        if self._fab is not None and self._decor is not None:
+            try:
+                if self._decor.equals(decor):
+                    return
+            except Exception:
+                pass
+        self._detach_views()
+        self._decor = decor
+        self._build_views()
+
+    def _build_views(self):
+        activity = self._current_activity()
+        if activity is None or self._decor is None:
+            return
+        ctx = activity
+
+        fab = TextView(ctx)
+        fab.setText("🧰")
+        fab.setGravity(Gravity.CENTER)
+        fab.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 24.0)
+        size = AndroidUtilities.dp(FAB_DP)
+        bg = GradientDrawable()
+        bg.setShape(GradientDrawable.OVAL)
+        bg.setColor(as_java_color(0xFF1A1A1A))
+        bg.setStroke(max(1, AndroidUtilities.dp(2)), as_java_color(0xFFFFFFFF))
+        fab.setBackground(bg)
+        try:
+            fab.setElevation(float(AndroidUtilities.dp(8)))
+        except Exception:
+            pass
+        fab.setAlpha(0.95)
+        fab.setClickable(True)
+        self._fab_touch = _FabTouchListener(self)
+        fab.setOnTouchListener(self._fab_touch)
+        self._decor.addView(fab, FrameLayout.LayoutParams(size, size))
+        self._fab = fab
+
+        status = TextView(ctx)
+        status.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.0)
+        status.setMaxWidth(AndroidUtilities.dp(300))
+        status.setPadding(
+            AndroidUtilities.dp(12),
+            AndroidUtilities.dp(7),
+            AndroidUtilities.dp(12),
+            AndroidUtilities.dp(7),
+        )
+        try:
+            status.setTypeface(AndroidUtilities.bold())
+        except Exception:
+            pass
+        sbg = GradientDrawable()
+        sbg.setCornerRadius(float(AndroidUtilities.dp(14)))
+        sbg.setColor(self._theme_color("key_windowBackgroundWhite", 0xFFFFFFFF))
+        sbg.setStroke(max(1, AndroidUtilities.dp(1)), self._theme_color("key_divider", 0xFFDDDDDD))
+        status.setBackground(sbg)
+        status.setTextColor(self._theme_color("key_windowBackgroundWhiteBlackText", 0xFF000000))
+        try:
+            status.setElevation(float(AndroidUtilities.dp(4)))
+        except Exception:
+            pass
+        status.setVisibility(View.GONE)
+        self._decor.addView(status, FrameLayout.LayoutParams(-2, -2))
+        self._status = status
+
+        self._apply_show_fab()
+        self._place_fab()
+
+    def _detach_views(self):
+        self._close_panel()
+        self._hide_lock()
+        for view in (self._status, self._fab):
+            self._remove_view(view)
+        self._status = None
+        self._fab = None
+        self._fab_touch = None
+        self._decor = None
+        self._fab_placed = False
+        self._panel_listeners = []
+        self._lock_listeners = []
+
+    def _remove_view(self, view):
+        if view is None:
+            return
+        try:
+            view.animate().cancel()
+        except Exception:
+            pass
+        try:
+            parent = view.getParent()
+            if parent is not None:
+                parent.removeView(view)
+        except Exception:
+            pass
+
+    def _theme_color(self, key_name, fallback):
+        try:
+            return Theme.getColor(getattr(Theme, key_name))
+        except Exception:
+            return as_java_color(fallback)
+
+    def _dp(self, value):
+        return float(AndroidUtilities.dp(value))
+
+    def _haptic(self, kind=3):
+        if not self._cfg.get("haptics", True) or self._fab is None:
+            return
+        try:
+            self._fab.performHapticFeedback(kind)
+        except Exception:
+            pass
+
+    def _place_fab(self):
+        fab = self._fab
+        decor = self._decor
+        if fab is None or decor is None:
+            return
+        width = decor.getWidth()
+        height = decor.getHeight()
+        if width <= 0 or height <= 0:
+            return
+        size = fab.getWidth() or AndroidUtilities.dp(FAB_DP)
+        span_x = max(1.0, float(width - size))
+        span_y = max(1.0, float(height - size))
+        if not self._fab_placed:
+            self._fab_placed = True
+            try:
+                fx = float(self.get_setting("fab_x", None)) / 1000.0
+                fy = float(self.get_setting("fab_y", None)) / 1000.0
+            except Exception:
+                fx, fy = 0.86, 0.76
+            fab.setTranslationX(float(clamp(fx, 0.0, 1.0) * span_x))
+            fab.setTranslationY(float(clamp(fy, 0.0, 1.0) * span_y))
+        else:
+            fab.setTranslationX(float(clamp(float(fab.getTranslationX()), 0.0, span_x)))
+            fab.setTranslationY(float(clamp(float(fab.getTranslationY()), 0.0, span_y)))
+        if self._panel is not None:
+            self._place_panel()
+
+    def _save_fab(self):
+        fab = self._fab
+        decor = self._decor
+        if fab is None or decor is None:
+            return
+        size = fab.getWidth() or AndroidUtilities.dp(FAB_DP)
+        span_x = max(1.0, float(decor.getWidth() - size))
+        span_y = max(1.0, float(decor.getHeight() - size))
+        try:
+            self._set_setting("fab_x", int(clamp(float(fab.getTranslationX()) / span_x, 0.0, 1.0) * 1000))
+            self._set_setting("fab_y", int(clamp(float(fab.getTranslationY()) / span_y, 0.0, 1.0) * 1000))
+        except Exception as e:
+            log(f"[{__id__}] save fab error: {e}")
+
+    def _on_fab_touch(self, event):
+        fab = self._fab
+        decor = self._decor
+        if fab is None or decor is None:
+            return False
+        action = event.getActionMasked()
+        rx = float(event.getRawX())
+        ry = float(event.getRawY())
+        now = time.monotonic()
+
+        if action == MotionEvent.ACTION_DOWN:
+            self._touch = {
+                "x0": rx,
+                "y0": ry,
+                "t0": now,
+                "ox": rx - float(fab.getTranslationX()),
+                "oy": ry - float(fab.getTranslationY()),
+                "moved": False,
+            }
+            self._haptic(4)
+            return True
+
+        touch = self._touch
+        if touch is None:
+            return False
+
+        if action == MotionEvent.ACTION_MOVE:
+            if not touch["moved"] and math.hypot(rx - touch["x0"], ry - touch["y0"]) > self._dp(8):
+                touch["moved"] = True
+            if touch["moved"]:
+                size = fab.getWidth() or AndroidUtilities.dp(FAB_DP)
+                w = decor.getWidth()
+                h = decor.getHeight()
+                fab.setTranslationX(float(clamp(rx - touch["ox"], -size * 0.3, w - size * 0.7)))
+                fab.setTranslationY(float(clamp(ry - touch["oy"], 0.0, h - size * 0.5)))
+                if self._panel is not None:
+                    self._place_panel()
+            return True
+
+        if action in (MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL):
+            self._touch = None
+            if touch["moved"]:
+                self._save_fab()
+            elif action == MotionEvent.ACTION_UP:
+                self._toggle_panel()
+            return True
+
+        return True
+
+    def _toggle_panel(self):
+        if self._panel_open:
+            self._close_panel()
+        else:
+            self._open_panel()
+
+    def _close_panel(self):
+        panel = self._panel
+        self._panel = None
+        self._panel_log = None
+        self._panel_listeners = []
+        self._panel_open = False
+        self._remove_view(panel)
+
+    def _open_panel(self):
+        self._ensure_attached(force=True)
+        if self._decor is None:
+            return
+        self._close_panel()
+        ctx = self._current_activity()
+        if ctx is None:
+            return
+        dp = AndroidUtilities.dp
+
+        panel = LinearLayout(ctx)
+        panel.setOrientation(LinearLayout.VERTICAL)
+        panel.setPadding(dp(12), dp(10), dp(12), dp(12))
+        bg = GradientDrawable()
+        bg.setCornerRadius(float(dp(16)))
+        bg.setColor(self._theme_color("key_windowBackgroundWhite", 0xFFFFFFFF))
+        bg.setStroke(max(1, dp(1)), self._theme_color("key_divider", 0xFFDDDDDD))
+        panel.setBackground(bg)
+        try:
+            panel.setElevation(float(dp(10)))
+        except Exception:
+            pass
+
+        header = LinearLayout(ctx)
+        header.setOrientation(LinearLayout.HORIZONTAL)
+        header.setGravity(Gravity.CENTER_VERTICAL)
+        title = TextView(ctx)
+        title.setText("🧰 Exter Suite")
+        title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16.0)
+        title.setTextColor(self._theme_color("key_windowBackgroundWhiteBlackText", 0xFF000000))
+        try:
+            title.setTypeface(AndroidUtilities.bold())
+        except Exception:
+            pass
+        header.addView(title, LinearLayout.LayoutParams(0, -2, 1.0))
+        close = TextView(ctx)
+        close.setText("✕")
+        close.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 18.0)
+        close.setTextColor(self._theme_color("key_windowBackgroundWhiteGrayText", 0xFF888888))
+        close.setPadding(dp(14), dp(4), dp(4), dp(4))
+        close.setClickable(True)
+        close_listener = _OnClickListener(self._close_panel)
+        self._panel_listeners.append(close_listener)
+        close.setOnClickListener(close_listener)
+        header.addView(close, LinearLayout.LayoutParams(-2, -2))
+        panel.addView(header, LinearLayout.LayoutParams(-1, -2))
+
+        log_view = TextView(ctx)
+        log_view.setText("Выбери действие. Команды также работают в чате: .help")
+        log_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.0)
+        log_view.setTextColor(self._theme_color("key_windowBackgroundWhiteGrayText", 0xFF888888))
+        log_lp = LinearLayout.LayoutParams(-1, -2)
+        log_lp.setMargins(0, dp(6), 0, dp(2))
+        panel.addView(log_view, log_lp)
+        self._panel_log = log_view
+
+        scroll = ScrollView(ctx)
+        content = LinearLayout(ctx)
+        content.setOrientation(LinearLayout.VERTICAL)
+        scroll.addView(content, LinearLayout.LayoutParams(-1, -2))
+
+        rows = [
+            ("🛰 Пинг", self._action_ping),
+            ("💱 Валюта по умолчанию", self._action_currency),
+            ("⏰ Таймеры", self._action_timers),
+            ("🎂 Дни рождения", self._action_birthdays),
+            ("📤 Экспорт HTML", lambda: self._action_export_format("html")),
+            ("📤 Экспорт JSON", lambda: self._action_export_format("json")),
+            ("📤 Экспорт TXT", lambda: self._action_export_format("txt")),
+            ("🧹 Проверить Избранное", self._action_scan_saved),
+            ("🗑 Удалить дубликаты", self._action_delete_dupes),
+            ("📖 Прочитать всё", self._action_read_all),
+            ("▶️ Автопроигрывание: переключить", self._action_toggle_autoplay),
+            ("♾ Бесконечная прокрутка: переключить", self._action_toggle_endless),
+            ("🔒 Паника-блокировка", self._action_lock),
+            ("🌐 Прокси/exitFy статус", self._action_proxy_status),
+            ("ℹ️ Помощь", self._action_help),
+        ]
+        for text, fn in rows:
+            self._mk_row(ctx, content, text, fn, self._panel_listeners)
+
+        height = self._decor.getHeight()
+        scroll_h = min(dp(330), int(height * 0.55)) if height > 0 else dp(330)
+        panel.addView(scroll, LinearLayout.LayoutParams(-1, scroll_h))
+
+        self._decor.addView(panel, FrameLayout.LayoutParams(dp(PANEL_DP), -2))
+        self._panel = panel
+        self._panel_open = True
+        self._place_panel()
+        panel.setAlpha(0.0)
+        panel.animate().alpha(1.0).setDuration(160).start()
+
+    def _mk_row(self, ctx, parent, text, fn, listeners):
+        dp = AndroidUtilities.dp
+        tv = TextView(ctx)
+        tv.setText(text)
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14.0)
+        tv.setTextColor(self._theme_color("key_windowBackgroundWhiteBlackText", 0xFF000000))
+        tv.setPadding(dp(12), dp(9), dp(12), dp(9))
+        bg = GradientDrawable()
+        bg.setCornerRadius(float(dp(10)))
+        bg.setColor(self._theme_color("key_windowBackgroundGray", 0xFFF0F0F0))
+        tv.setBackground(bg)
+        tv.setClickable(True)
+        listener = _OnClickListener(fn)
+        listeners.append(listener)
+        tv.setOnClickListener(listener)
+        lp = LinearLayout.LayoutParams(-1, -2)
+        lp.setMargins(0, dp(4), 0, 0)
+        parent.addView(tv, lp)
+        return tv
+
+    def _place_panel(self):
+        panel, fab, decor = self._panel, self._fab, self._decor
+        if panel is None or decor is None:
+            return
+        width = decor.getWidth()
+        height = decor.getHeight()
+        if width <= 0 or height <= 0:
+            return
+        pw = AndroidUtilities.dp(PANEL_DP)
+        panel.measure(
+            View.MeasureSpec.makeMeasureSpec(pw, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(max(height, 1), View.MeasureSpec.AT_MOST),
+        )
+        ph = panel.getMeasuredHeight()
+        if fab is not None and fab.getVisibility() == View.VISIBLE:
+            size = fab.getWidth() or AndroidUtilities.dp(FAB_DP)
+            cx = float(fab.getTranslationX())
+            cy = float(fab.getTranslationY())
+        else:
+            size = AndroidUtilities.dp(FAB_DP)
+            cx = (width - size) / 2.0
+            cy = (height - size) / 2.0
+        gap = float(AndroidUtilities.dp(8))
+        x = cx if cx + size / 2.0 < width / 2.0 else cx + size - pw
+        x = clamp(x, gap, max(gap, width - pw - gap))
+        y = cy - ph - gap if cy + size / 2.0 > height / 2.0 else cy + size + gap
+        top = float(AndroidUtilities.statusBarHeight)
+        y = clamp(y, top + gap, max(top + gap, height - ph - gap))
+        panel.setTranslationX(float(x))
+        panel.setTranslationY(float(y))
+
+    def _show_status(self, text):
+        text = str(text)
+        if self._status is None:
+            self._ensure_attached(force=True)
+        if self._status is None:
+            self._toast(text)
+            return
+
+        self._status_gen += 1
+        gen = self._status_gen
+        self._status.setText(text)
+        self._status.setAlpha(1.0)
+        self._status.setVisibility(View.VISIBLE)
+        try:
+            self._status.bringToFront()
+        except Exception:
+            pass
+
+        seconds = STATUS_SECONDS[clamp(int(self._cfg.get("status_idx", 1)), 0, len(STATUS_SECONDS) - 1)]
+
+        def expire():
+            if gen == self._status_gen:
+                self._hide_status()
+
+        self._post(expire, int(seconds * 1000))
+
+    def _hide_status(self):
+        status = self._status
+        if status is None or status.getVisibility() != View.VISIBLE:
+            return
+        self._status_gen += 1
+        gen = self._status_gen
+
+        def done():
+            if gen == self._status_gen and self._status is not None:
+                self._status.setVisibility(View.GONE)
+
+        anim = status.animate().alpha(0.0).setDuration(180)
+        anim.withEndAction(R(done))
+        anim.start()
+
+    def _toast(self, text):
+        def run():
+            ctx = self._context()
+            if ctx is None:
+                return
+            try:
+                Toast.makeText(ctx, str(text), Toast.LENGTH_SHORT).show()
+            except Exception:
+                pass
+        self._on_ui(run)
+
+    def _step(self):
+        now = time.monotonic()
+        self._last_tick = now
+        if self._decor is None or self._fab is None:
+            self._ensure_attached()
+        if self._locked:
+            return
+        self._place_fab()
+        self._place_status()
+        if now >= self._next_timer_check:
+            self._next_timer_check = now + 1.0
+            self._check_timers()
+            self._check_birthdays()
+        if self._cfg.get("endless_scroll", False) and now >= self._next_endless:
+            self._next_endless = now + 0.25
+            self._do_endless_scroll()
+        if self._cfg.get("no_autoplay", False) and now >= self._next_autoplay_check:
+            self._next_autoplay_check = now + 10.0
+            self._apply_autoplay()
+
+    def _place_status(self):
+        status = self._status
+        decor = self._decor
+        if status is None or decor is None or status.getVisibility() != View.VISIBLE:
+            return
+        sw = status.getWidth()
+        sh = status.getHeight()
+        if sw <= 0:
+            return
+        width = decor.getWidth()
+        margin = self._dp(6)
+        x = clamp((width - sw) / 2.0, margin, max(margin, width - sw - margin))
+        y = float(AndroidUtilities.statusBarHeight) + self._dp(8)
+        status.setTranslationX(float(x))
+        status.setTranslationY(float(y))
+
+    def _current_dialog_id(self):
+        try:
+            frag = get_last_fragment()
+            if frag is not None and isinstance(frag, ChatActivity):
+                return int(frag.getDialogId())
+        except Exception:
+            pass
+        return 0
+
+    def _is_saved_current(self):
+        try:
+            frag = get_last_fragment()
+            if frag is not None and isinstance(frag, ChatActivity):
+                user = frag.getCurrentUser()
+                if user is not None and UserObject.isUserSelf(user):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _reply(self, dialog_id, text):
+        text = str(text)
+        if dialog_id:
+            self._on_ui(lambda: self._send_reply(dialog_id, text))
+        else:
+            self._show_status(text)
+
+    def _send_reply(self, dialog_id, text):
+        try:
+            send_text(int(dialog_id), f"{REPLY_MARK} {text}")
+        except Exception as e:
+            self._show_status(f"Не отправлено: {e}")
+
+    def _handle_command(self, account, raw):
+        body = str(raw).strip()
+        if not body.startswith(PREFIX):
+            return
+        body = body[len(PREFIX):].strip()
+        if not body:
+            return
+        if self._cfg.get("commands_saved_only", False) and not self._is_saved_current():
+            return
+        parts = body.split()
+        cmd = parts[0].lower()
+        args = parts[1:]
+        dialog_id = self._current_dialog_id()
+
+        if cmd in ("help", "?", "помощь"):
+            self._reply(dialog_id, HELP_TEXT)
+        elif cmd in ("cr", "курс", "currency"):
+            self._cmd_cr(args, dialog_id)
+        elif cmd == "ping":
+            self._cmd_ping(args, dialog_id)
+        elif cmd == "timer":
+            self._cmd_timer(args, dialog_id)
+        elif cmd == "timers":
+            self._cmd_timers(dialog_id)
+        elif cmd == "cancel":
+            self._cmd_cancel(args, dialog_id)
+        elif cmd in ("bday", "birthday", "др"):
+            self._cmd_bday(args, dialog_id)
+        elif cmd == "export":
+            self._cmd_export(args, dialog_id)
+        elif cmd in ("cleansaved", "savedclean", "очиститьизбранное"):
+            self._cmd_cleansaved(args, dialog_id)
+        elif cmd in ("readall", "прочитатьвсё"):
+            self._cmd_readall(dialog_id)
+        elif cmd == "autoplay":
+            self._cmd_autoplay(args, dialog_id)
+        elif cmd == "endless":
+            self._cmd_endless(args, dialog_id)
+        elif cmd == "proxy":
+            self._cmd_proxy(args, dialog_id)
+        elif cmd == "exit":
+            self._cmd_exit(args, dialog_id)
+        elif cmd == "pass":
+            self._cmd_pass(args, dialog_id)
+        elif cmd == "panic":
+            self._cmd_panic(args, dialog_id)
+        elif cmd == "lock":
+            self._show_lock()
+            self._reply(dialog_id, "Блокировка вызвана.")
+        else:
+            self._reply(dialog_id, f"Неизвестная команда: .{cmd}. Используй .help")
+
+    def _cmd_cr(self, args, dialog_id):
+        if not args:
+            self._reply(dialog_id, f"Пример: .cr 100 {self._cfg.get('currency_from','USD')} {self._cfg.get('currency_to','RUB')}")
+            return
+        amount_str = str(args[0]).replace(",", ".")
+        try:
+            amount = float(amount_str)
+        except Exception:
+            self._reply(dialog_id, "Не понял сумму. Пример: .cr 100 USD RUB")
+            return
+        frm = str(args[1]).upper() if len(args) > 1 else self._cfg.get("currency_from", "USD")
+        to = str(args[2]).upper() if len(args) > 2 else self._cfg.get("currency_to", "RUB")
+
+        if not self._cfg.get("currency_fetch", True):
+            self._convert_and_reply(amount, frm, to, dialog_id, self._get_cached_rates() or FALLBACK_RATES, "offline")
+            return
+
+        def worker():
+            try:
+                rates = self._fetch_rates()
+                source = "live/cache"
+            except Exception:
+                rates = self._get_cached_rates() or FALLBACK_RATES
+                source = "fallback"
+            self._on_ui(lambda: self._convert_and_reply(amount, frm, to, dialog_id, rates, source))
+
+        t = Thread(target=worker)
+        t.daemon = True
+        t.start()
+
+    def _convert_and_reply(self, amount, frm, to, dialog_id, rates, source):
+        try:
+            frm = str(frm).upper()
+            to = str(to).upper()
+            rf = float(rates.get(frm, 0) or 0)
+            rt = float(rates.get(to, 0) or 0)
+            if rf <= 0 or rt <= 0:
+                self._reply(dialog_id, f"Не знаю курс для {frm}/{to}.")
+                return
+            result = amount * rt / rf
+            self._reply(dialog_id, f"{amount:g} {frm} = {result:.2f} {to} [{source}]")
+        except Exception as e:
+            self._reply(dialog_id, f"Ошибка конвертации: {e}")
+
+    def _get_cached_rates(self):
+        try:
+            ts = float(self.get_setting("rates_time", 0) or 0)
+            if time.time() - ts < 3600:
+                raw = str(self.get_setting("rates_json", "") or "")
+                if raw:
+                    d = json.loads(raw)
+                    if isinstance(d, dict) and d:
+                        return d
+        except Exception:
+            pass
+        return None
+
+    def _fetch_rates(self):
+        cached = self._get_cached_rates()
+        if cached:
+            return cached
+        url = "https://open.er-api.com/v6/latest/USD"
+        conn = URL(url).openConnection()
+        try:
+            conn.setConnectTimeout(4000)
+            conn.setReadTimeout(4000)
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 ExterSuite/1.0")
+            conn.connect()
+            code = int(conn.getResponseCode())
+            if code != 200:
+                raise Exception(f"HTTP {code}")
+            reader = BufferedReader(InputStreamReader(conn.getInputStream(), "UTF-8"))
+            chunks = []
+            line = reader.readLine()
+            while line is not None:
+                chunks.append(str(line))
+                line = reader.readLine()
+            try:
+                reader.close()
+            except Exception:
+                pass
+            data = JSONObject("".join(chunks))
+            rates_obj = data.getJSONObject("rates")
+            rates = {"USD": 1.0}
+            it = rates_obj.keys()
+            while it.hasNext():
+                k = str(it.next())
+                try:
+                    rates[k] = float(rates_obj.getDouble(k))
+                except Exception:
+                    pass
+            self._set_setting("rates_json", json.dumps(rates, ensure_ascii=False))
+            self._set_setting("rates_time", str(time.time()))
+            return rates
+        finally:
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+
+    def _cmd_ping(self, args, dialog_id):
+        host = str(args[0]) if len(args) > 0 else self._cfg.get("ping_host", "1.1.1.1")
+        try:
+            port = int(args[1]) if len(args) > 1 else 443
+        except Exception:
+            port = 443
+        try:
+            count = int(args[2]) if len(args) > 2 else 3
+        except Exception:
+            count = 3
+        count = clamp(count, 1, 10)
+
+        def worker():
+            results = self._ping_host(host, port, count)
+            if results:
+                avg = sum(results) / len(results)
+                self._reply(dialog_id, f"Ping {host}:{port} → avg {avg:.1f} ms, min {min(results):.1f}, max {max(results):.1f}, n={len(results)}")
+            else:
+                self._reply(dialog_id, f"Ping {host}:{port} — нет ответа.")
+
+        t = Thread(target=worker)
+        t.daemon = True
+        t.start()
+
+    def _ping_host(self, host, port, count):
+        results = []
+        for _ in range(int(count)):
+            sock = Socket()
+            try:
+                t0 = time.monotonic()
+                sock.connect(InetSocketAddress(str(host), int(port)), 2000)
+                results.append((time.monotonic() - t0) * 1000.0)
+            except Exception:
+                pass
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        return results
+
+    def _cmd_timer(self, args, dialog_id):
+        if not args:
+            self._reply(dialog_id, "Пример: .timer 10m Выпить воды")
+            return
+        seconds = parse_duration(args[0])
+        if not seconds:
+            self._reply(dialog_id, "Не понял длительность. Примеры: 30s, 10m, 2h, 1d")
+            return
+        label = " ".join(args[1:]).strip() or "Таймер"
+        timers = self._load_json("timers", [])
+        try:
+            seq = int(self.get_setting("timer_seq", 0) or 0) + 1
+        except Exception:
+            seq = len(timers) + 1
+        timers.append({"id": seq, "due": time.time() + seconds, "label": label})
+        self._save_json("timers", timers)
+        self._set_setting("timer_seq", seq)
+        self._reply(dialog_id, f"Таймер #{seq} создан: {label} через {seconds} сек.")
+
+    def _cmd_timers(self, dialog_id):
+        timers = self._load_json("timers", [])
+        if not timers:
+            self._reply(dialog_id, "Таймеров нет.")
+            return
+        now = time.time()
+        lines = []
+        for t in timers:
+            left = max(0, int(float(t.get("due", now)) - now))
+            lines.append(f"#{t.get('id')} {left}s — {t.get('label')}")
+        self._reply(dialog_id, "Таймеры:\n" + "\n".join(lines))
+
+    def _cmd_cancel(self, args, dialog_id):
+        if not args:
+            self._reply(dialog_id, "Пример: .cancel 1")
+            return
+        try:
+            tid = int(args[0])
+        except Exception:
+            self._reply(dialog_id, "Не понял ID таймера.")
+            return
+        timers = self._load_json("timers", [])
+        kept = [t for t in timers if int(t.get("id", -1)) != tid]
+        if len(kept) == len(timers):
+            self._reply(dialog_id, f"Таймер #{tid} не найден.")
+        else:
+            self._save_json("timers", kept)
+            self._reply(dialog_id, f"Таймер #{tid} удалён.")
+
+    def _check_timers(self):
+        if not self._cfg.get("timers_enabled", True):
+            return
+        timers = self._load_json("timers", [])
+        if not timers:
+            return
+        now = time.time()
+        due = [t for t in timers if float(t.get("due", now + 1)) <= now]
+        if not due:
+            return
+        kept = [t for t in timers if float(t.get("due", now + 1)) > now]
+        self._save_json("timers", kept)
+        for t in due:
+            label = str(t.get("label", "Таймер"))
+            self._notify_event(f"⏰ {label}", "timer_send_chat")
+
+    def _cmd_bday(self, args, dialog_id):
+        if not args:
+            self._reply(dialog_id, ".bday add Имя 31.12 | .bday list | .bday next | .bday del ID")
+            return
+        sub = str(args[0]).lower()
+        bdays = self._load_json("birthdays", [])
+        if sub == "add":
+            if len(args) < 3:
+                self._reply(dialog_id, "Пример: .bday add Мама 31.12")
+                return
+            date_str = args[-1]
+            name = " ".join(args[1:-1]).strip()
+            md = re.fullmatch(r"(\d{1,2})[.\-/](\d{1,2})", str(date_str))
+            if not md or not name:
+                self._reply(dialog_id, "Не понял дату. Формат: 31.12 или 31/12")
+                return
+            day = int(md.group(1))
+            month = int(md.group(2))
+            try:
+                datetime.date(2000, month, day)
+            except Exception:
+                self._reply(dialog_id, "Некорректная дата.")
+                return
+            try:
+                seq = int(self.get_setting("birthday_seq", 0) or 0) + 1
+            except Exception:
+                seq = len(bdays) + 1
+            bdays.append({"id": seq, "name": name, "date": f"{day:02d}.{month:02d}", "notified": "", "notified_today": ""})
+            self._save_json("birthdays", bdays)
+            self._set_setting("birthday_seq", seq)
+            self._reply(dialog_id, f"День рождения добавлен: #{seq} {name} — {day:02d}.{month:02d}")
+        elif sub == "list":
+            if not bdays:
+                self._reply(dialog_id, "Дней рождения нет.")
+                return
+            lines = [f"#{b.get('id')} {b.get('name')} — {b.get('date')}" for b in bdays]
+            self._reply(dialog_id, "Дни рождения:\n" + "\n".join(lines))
+        elif sub == "next":
+            today = datetime.date.today()
+            items = []
+            for b in bdays:
+                days = self._days_until_bday(b, today)
+                if days is not None:
+                    items.append((days, b))
+            if not items:
+                self._reply(dialog_id, "Нет корректных дат.")
+                return
+            items.sort(key=lambda x: x[0])
+            days, b = items[0]
+            self._reply(dialog_id, f"Ближайший: {b.get('name')} через {days} дн. ({b.get('date')})")
+        elif sub == "del":
+            if len(args) < 2:
+                self._reply(dialog_id, "Пример: .bday del 1")
+                return
+            try:
+                bid = int(args[1])
+            except Exception:
+                self._reply(dialog_id, "Не понял ID.")
+                return
+            kept = [b for b in bdays if int(b.get("id", -1)) != bid]
+            if len(kept) == len(bdays):
+                self._reply(dialog_id, f"Запись #{bid} не найдена.")
+            else:
+                self._save_json("birthdays", kept)
+                self._reply(dialog_id, f"Запись #{bid} удалена.")
+        else:
+            self._reply(dialog_id, "Подкоманды: add, list, next, del")
+
+    def _days_until_bday(self, b, today):
+        try:
+            day, month = [int(x) for x in str(b.get("date", "")).split(".")]
+        except Exception:
+            return None
+        d = self._make_date(month, day, today.year)
+        if d is None:
+            return None
+        if d < today:
+            d = self._make_date(month, day, today.year + 1)
+        if d is None:
+            return None
+        return (d - today).days
+
+    def _make_date(self, month, day, year):
+        try:
+            return datetime.date(year, month, day)
+        except ValueError:
+            if month == 2 and day == 29:
+                try:
+                    return datetime.date(year, 3, 1)
+                except Exception:
+                    return None
+            return None
+
+    def _check_birthdays(self):
+        remind_days = REMIND_DAYS[clamp(int(self._cfg.get("remind_idx", 3)), 0, len(REMIND_DAYS) - 1)]
+        if remind_days < 0:
+            return
+        bdays = self._load_json("birthdays", [])
+        if not bdays:
+            return
+        today = datetime.date.today()
+        changed = False
+        for b in bdays:
+            days = self._days_until_bday(b, today)
+            if days is None:
+                continue
+            key_window = f"{today.year}:{b.get('date')}:{remind_days}"
+            key_today = f"{today.year}:{b.get('date')}"
+            if remind_days == 0:
+                if days == 0 and b.get("notified_today") != key_today:
+                    b["notified_today"] = key_today
+                    changed = True
+                    self._notify_event(f"🎂 Сегодня ДР: {b.get('name')}", "birthday_send_chat")
+            else:
+                if 0 < days <= remind_days and b.get("notified") != key_window:
+                    b["notified"] = key_window
+                    changed = True
+                    self._notify_event(f"🎂 Через {days} дн. ДР: {b.get('name')}", "birthday_send_chat")
+                if days == 0 and b.get("notified_today") != key_today:
+                    b["notified_today"] = key_today
+                    changed = True
+                    self._notify_event(f"🎂 Сегодня ДР: {b.get('name')}", "birthday_send_chat")
+        if changed:
+            self._save_json("birthdays", bdays)
+
+    def _notify_event(self, text, send_key):
+        self._show_status(text)
+        self._toast(text)
+        if self._cfg.get(send_key, False):
+            dialog_id = self._current_dialog_id()
+            if dialog_id:
+                self._reply(dialog_id, text)
+
+    def _cmd_export(self, args, dialog_id):
+        fmt = str(args[0]).lower() if args else ["html", "json", "txt"][clamp(int(self._cfg.get("export_idx", 0)), 0, 2)]
+        if fmt in ("htm",):
+            fmt = "html"
+        if fmt not in ("html", "json", "txt"):
+            self._reply(dialog_id, "Форматы: html, json, txt")
+            return
+        self._export_chat(fmt, dialog_id)
+
+    def _export_chat(self, fmt, dialog_id):
+        self._show_status("Экспорт…")
+        msgs = self._collect_messages()
+        if not msgs:
+            self._reply(dialog_id, "Не удалось собрать сообщения. Открой чат и прокрути историю.")
+            return
+        text = self._format_export(msgs, fmt, dialog_id)
+        ctx = self._context()
+        if ctx is None:
+            self._reply(dialog_id, "Нет контекста для записи файла.")
+            return
+        try:
+            base = ctx.getExternalFilesDir(None)
+            if base is None:
+                base = ctx.getCacheDir()
+            filename = f"exter_export_{dialog_id}_{int(time.time())}.{fmt}"
+            file = File(base, filename)
+            fos = FileOutputStream(file)
+            fos.write(String(text).getBytes("UTF-8"))
+            fos.flush()
+            fos.close()
+            self._reply(dialog_id, f"Экспортировано {len(msgs)} сообщений: {file.getAbsolutePath()}")
+        except Exception as e:
+            self._reply(dialog_id, f"Ошибка записи файла: {e}")
+
+    def _collect_messages(self):
+        frag = None
+        try:
+            frag = get_last_fragment()
+        except Exception:
+            frag = None
+        if frag is None or not isinstance(frag, ChatActivity):
+            return []
+        try:
+            dialog_id = int(frag.getDialogId())
+        except Exception:
+            return []
+        account = 0
+        try:
+            mc = MessagesController.getInstance(account)
+        except Exception:
+            return []
+        limit = min(EXPORT_LIMITS[clamp(int(self._cfg.get("export_idx", 1)), 0, len(EXPORT_LIMITS) - 1)], MAX_EXPORT_HARD)
+        out = []
+
+        dialog = self._call_method(mc, ["getDialog", "getDialogObject"], dialog_id, account)
+        if dialog is None:
+            dialog = self._call_method(mc, ["getDialog"], dialog_id)
+        messages = None
+        if dialog is not None:
+            messages = self._get_attr(dialog, ["messages", "messageList", "msgs", "messagesArray"])
+        if messages is None:
+            messages = self._call_method(mc, ["getDialogMessages", "getMessages", "loadDialogMessages"], dialog_id, account)
+        if messages is None:
+            messages = self._call_method(mc, ["getDialogMessages", "getMessages"], dialog_id)
+
+        if messages is not None:
+            getter = None
+            size = 0
+            try:
+                size = int(messages.size())
+                getter = messages.get
+            except Exception:
+                try:
+                    size = len(messages)
+                    getter = lambda i: messages[i]
+                except Exception:
+                    size = 0
+            for i in range(min(size, limit)):
+                try:
+                    msg = getter(i)
+                except Exception:
+                    continue
+                d = self._message_dict(msg, mc)
+                if d:
+                    out.append(d)
+
+        if not out:
+            listing = self._call_method(frag, ["getChatListView", "getListView", "getRecyclerView"])
+            if listing is not None:
+                try:
+                    count = int(listing.getChildCount())
+                except Exception:
+                    count = 0
+                for i in range(count):
+                    try:
+                        child = listing.getChildAt(i)
+                    except Exception:
+                        continue
+                    if child is None:
+                        continue
+                    if ChatMessageCell is not None and isinstance(child, ChatMessageCell):
+                        mo = self._call_method(child, ["getMessageObject"])
+                        d = self._message_dict(mo, mc)
+                        if d:
+                            out.append(d)
+        return out[:limit]
+
+    def _message_dict(self, msg, mc):
+        if msg is None:
+            return None
+        owner = getattr(msg, "messageOwner", None) or msg
+        text = getattr(owner, "message", None) or getattr(owner, "caption", None) or getattr(msg, "message", None)
+        text = str(text) if text is not None else ""
+        try:
+            date = int(getattr(owner, "date", 0) or getattr(msg, "date", 0) or 0)
+        except Exception:
+            date = 0
+        try:
+            mid = int(getattr(owner, "id", 0) or getattr(msg, "id", 0) or 0)
+        except Exception:
+            mid = 0
+        try:
+            from_id = int(getattr(owner, "fromId", 0) or getattr(msg, "fromId", 0) or 0)
+        except Exception:
+            from_id = 0
+        try:
+            out = bool(getattr(owner, "out", False) or getattr(msg, "out", False))
+        except Exception:
+            out = False
+        sender = "Вы" if out else str(from_id)
+        if not out and from_id:
+            try:
+                user = self._call_method(mc, ["getUser", "getUserSafe"], from_id)
+                if user is not None:
+                    first = UserObject.getFirstName(user)
+                    last = None
+                    try:
+                        last = UserObject.getLastName(user)
+                    except Exception:
+                        last = None
+                    name = (str(first or "") + " " + str(last or "")).strip()
+                    if not name:
+                        try:
+                            name = str(UserObject.getUserName(user) or "")
+                        except Exception:
+                            name = ""
+                    if name:
+                        sender = name
+            except Exception:
+                pass
+        if not text:
+            text = "[медиа/без текста]"
+        return {"id": mid, "date": date, "from": from_id, "out": out, "sender": sender, "text": text}
+
+    def _format_export(self, msgs, fmt, dialog_id):
+        msgs = sorted(msgs, key=lambda x: int(x.get("date", 0) or 0))
+        if fmt == "json":
+            return json.dumps({
+                "plugin": __id__,
+                "dialog_id": dialog_id,
+                "exported_at": time.time(),
+                "count": len(msgs),
+                "messages": msgs,
+            }, ensure_ascii=False, indent=2)
+        if fmt == "txt":
+            lines = []
+            for m in msgs:
+                ts = m.get("date", 0)
+                try:
+                    dt = datetime.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    dt = str(ts)
+                lines.append(f"[{dt}] {m.get('sender','?')}: {m.get('text','')}")
+            return "\n".join(lines)
+        parts = [
+            "<!doctype html><meta charset='utf-8'>",
+            f"<title>Export {dialog_id}</title>",
+            "<style>body{font-family:sans-serif;margin:16px}.m{margin:8px 0;padding:8px;border:1px solid #ddd;border-radius:8px}.d{color:#777;font-size:12px}.s{font-weight:bold}</style>",
+            f"<h1>Chat export {dialog_id}</h1>",
+        ]
+        for m in msgs:
+            ts = m.get("date", 0)
+            try:
+                dt = datetime.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                dt = str(ts)
+            sender = html.escape(str(m.get("sender", "?")))
+            text = html.escape(str(m.get("text", ""))).replace("\n", "<br>")
+            parts.append(f"<div class='m'><div class='d'>{html.escape(dt)}</div><div class='s'>{sender}</div><div>{text}</div></div>")
+        return "\n".join(parts)
+
+    def _cmd_cleansaved(self, args, dialog_id):
+        delete = bool(args and str(args[0]).lower() in ("delete", "del", "удалить"))
+        if delete and not self._cfg.get("saved_allow_delete", False):
+            self._reply(dialog_id, "Удаление дубликатов выключено в настройках.")
+            return
+        self._show_status("Сканирование…")
+        msgs = self._collect_messages()
+        if not msgs:
+            self._reply(dialog_id, "Нет сообщений для анализа.")
+            return
+        groups = {}
+        for m in msgs:
+            text = str(m.get("text", "")).strip()
+            if not text or text == "[медиа/без текста]":
+                continue
+            key = normalize_text(text)
+            if not key:
+                continue
+            groups.setdefault(key, []).append(m)
+        dupes = []
+        for arr in groups.values():
+            if len(arr) > 1:
+                arr.sort(key=lambda x: (int(x.get("date", 0) or 0), int(x.get("id", 0) or 0)))
+                dupes.extend(arr[1:])
+        if not dupes:
+            self._reply(dialog_id, "Дубликатов не найдено.")
+            return
+        ids = [int(m.get("id", 0)) for m in dupes if int(m.get("id", 0) or 0) > 0]
+        preview = ", ".join(str(i) for i in ids[:20])
+        self._reply(dialog_id, f"Найдено дубликатов: {len(dupes)}. ID: {preview}")
+        if delete:
+            if not ids:
+                self._reply(dialog_id, "Нет ID для удаления.")
+                return
+            if not self._is_saved_current():
+                self._reply(dialog_id, "Удаление разрешено только в Избранном.")
+                return
+            ok = self._delete_messages(0, dialog_id, ids)
+            self._reply(dialog_id, "Удаление отправлено." if ok else "Не удалось вызвать удаление через текущий API.")
+
+    def _delete_messages(self, account, dialog_id, ids):
+        try:
+            mc = MessagesController.getInstance(account)
+            arr = ArrayList()
+            for mid in ids:
+                try:
+                    arr.add(jint(int(mid)))
+                except Exception:
+                    pass
+            if self._try_call(mc, ["deleteMessages"], account, dialog_id, arr, 0):
+                return True
+            if self._try_call(mc, ["deleteMessages"], dialog_id, arr, 0):
+                return True
+            if self._try_call(mc, ["deleteDialogMessages"], account, dialog_id, arr, 0):
+                return True
+        except Exception as e:
+            log(f"[{__id__}] delete messages error: {e}")
+        return False
+
+    def _cmd_readall(self, dialog_id):
+        ok = self._read_all()
+        self._reply(dialog_id, "Read all: вызов отправлен." if ok else "Read all: не удалось найти подходящий метод.")
+
+    def _read_all(self):
+        try:
+            mc = MessagesController.getInstance(0)
+        except Exception:
+            return False
+        names = ["markAllMessagesAsRead", "markAllChatsAsRead", "readAllDialogs", "markAllDialogsAsRead"]
+        if self._try_call(mc, names, 0):
+            return True
+        if self._try_call(mc, names):
+            return True
+        return False
+
+    def _cmd_autoplay(self, args, dialog_id):
+        if args:
+            v = str(args[0]).lower()
+            if v in ("on", "enable", "1", "true", "запретить"):
+                val = True
+            elif v in ("off", "disable", "0", "false", "разрешить"):
+                val = False
+            else:
+                val = not bool(self._cfg.get("no_autoplay", False))
+        else:
+            val = not bool(self._cfg.get("no_autoplay", False))
+        self._cfg["no_autoplay"] = val
+        self._set_setting("no_autoplay", val)
+        self._apply_autoplay()
+        self._reply(dialog_id, "Автопроигрывание запрещено." if val else "Автопроигрывание не блокируется плагином.")
+
+    def _apply_autoplay(self):
+        if not self._cfg.get("no_autoplay", False):
+            return
+        ctx = self._context()
+        if ctx is None:
+            return
+        names = []
+        try:
+            names.append(str(ctx.getPackageName()) + "_preferences")
+        except Exception:
+            pass
+        names += ["preferences", "TelegramPrefs", "ExterGramPrefs"]
+        keys = ["autoplay_videos", "autoplay_gifs", "autoplay_music", "autoplay_enabled", "autoplay_voice"]
+        for pname in names:
+            try:
+                prefs = ctx.getSharedPreferences(pname, 0)
+                edit = prefs.edit()
+                for k in keys:
+                    try:
+                        edit.putBoolean(k, False)
+                    except Exception:
+                        pass
+                edit.commit()
+            except Exception:
+                pass
+        try:
+            controller = MediaController.getInstance()
+            self._try_call(controller, ["stopPlayback", "pausePlayback", "stop"])
+        except Exception:
+            pass
+
+    def _cmd_endless(self, args, dialog_id):
+        if args:
+            v = str(args[0]).lower()
+            if v in ("on", "enable", "1", "true"):
+                val = True
+            elif v in ("off", "disable", "0", "false"):
+                val = False
+            else:
+                val = not bool(self._cfg.get("endless_scroll", False))
+        else:
+            val = not bool(self._cfg.get("endless_scroll", False))
+        self._cfg["endless_scroll"] = val
+        self._set_setting("endless_scroll", val)
+        self._reply(dialog_id, "Бесконечная прокрутка включена." if val else "Бесконечная прокрутка выключена.")
+
+    def _do_endless_scroll(self):
+        if self._decor is None:
+            return
+        try:
+            frag = get_last_fragment()
+        except Exception:
+            frag = None
+        if frag is None:
+            return
+        if isinstance(frag, ChatActivity):
+            return
+        try:
+            cname = str(frag.getClass().getName()).lower()
+        except Exception:
+            cname = ""
+        if not any(x in cname for x in ("dialog", "folder", "chatlist", "home", "contact")):
+            return
+        rv = self._find_recycler(self._decor)
+        if rv is None:
+            return
+        try:
+            adapter = rv.getAdapter()
+            if adapter is None:
+                return
+            count = int(adapter.getItemCount())
+            if count <= 0:
+                return
+            lm = rv.getLayoutManager()
+            if lm is None:
+                return
+            last = -1
+            try:
+                last = int(lm.findLastCompletelyVisibleItemPosition())
+            except Exception:
+                try:
+                    last = int(lm.findLastVisibleItemPosition())
+                except Exception:
+                    last = -1
+            if last >= count - 3 and int(rv.getScrollState()) == 0:
+                rv.scrollBy(0, int(self._dp(120)))
+        except Exception:
+            pass
+
+    def _find_recycler(self, root):
+        stack = [root]
+        visited = 0
+        while stack and visited < 700:
+            v = stack.pop()
+            visited += 1
+            try:
+                if isinstance(v, RecyclerView):
+                    return v
+            except Exception:
+                pass
+            try:
+                if isinstance(v, ViewGroup):
+                    for i in range(int(v.getChildCount())):
+                        child = v.getChildAt(i)
+                        if child is not None:
+                            stack.append(child)
+            except Exception:
+                pass
+        return None
+
+    def _cmd_proxy(self, args, dialog_id):
+        if not args:
+            self._reply(dialog_id, ".proxy on|off|status|set type host port [user pass]")
+            return
+        sub = str(args[0]).lower()
+        cfg = self._load_json("proxy_cfg", {})
+        if sub == "on":
+            cfg["enabled"] = True
+            self._save_json("proxy_cfg", cfg)
+            self._set_setting("proxy_enable", True)
+            self._cfg["proxy_enable"] = True
+            self._apply_proxy_settings()
+            self._reply(dialog_id, "Proxy включён.")
+        elif sub == "off":
+            cfg["enabled"] = False
+            self._save_json("proxy_cfg", cfg)
+            self._set_setting("proxy_enable", False)
+            self._cfg["proxy_enable"] = False
+            self._apply_proxy_settings()
+            self._reply(dialog_id, "Proxy выключен.")
+        elif sub == "status":
+            if not cfg:
+                self._reply(dialog_id, "Proxy не настроен.")
+            else:
+                self._reply(dialog_id, f"Proxy: {'вкл' if cfg.get('enabled') else 'выкл'}, {cfg.get('type','http')}://{cfg.get('host','')}:{cfg.get('port','')}")
+        elif sub == "set":
+            if len(args) < 4:
+                self._reply(dialog_id, "Пример: .proxy set socks5 127.0.0.1 1080 user pass")
+                return
+            typ = str(args[1]).lower()
+            host = str(args[2])
+            try:
+                port = int(args[3])
+            except Exception:
+                self._reply(dialog_id, "Не понял порт.")
+                return
+            user = str(args[4]) if len(args) > 4 else ""
+            password = str(args[5]) if len(args) > 5 else ""
+            cfg = {"enabled": True, "type": typ, "host": host, "port": port, "user": user, "password": password}
+            self._save_json("proxy_cfg", cfg)
+            self._set_setting("proxy_enable", True)
+            self._cfg["proxy_enable"] = True
+            self._apply_proxy_settings()
+            self._reply(dialog_id, f"Proxy сохранён и включён: {typ}://{host}:{port}")
+        else:
+            self._reply(dialog_id, "Подкоманды: on, off, status, set")
+
+    def _apply_proxy_settings(self):
+        cfg = self._load_json("proxy_cfg", {})
+        props = [
+            "http.proxyHost", "http.proxyPort",
+            "https.proxyHost", "https.proxyPort",
+            "socksProxyHost", "socksProxyPort",
+            "http.nonProxyHosts", "https.nonProxyHosts",
+        ]
+        for p in props:
+            try:
+                clear = getattr(System, "clearProperty", None)
+                if clear is not None:
+                    clear(p)
+                else:
+                    System.setProperty(p, "")
+            except Exception:
+                pass
+        if not cfg.get("enabled"):
+            return
+        typ = str(cfg.get("type", "http")).lower()
+        host = str(cfg.get("host", ""))
+        port = str(cfg.get("port", ""))
+        if not host or not port:
+            return
+        try:
+            if typ in ("http", "https"):
+                System.setProperty("http.proxyHost", host)
+                System.setProperty("http.proxyPort", port)
+                System.setProperty("https.proxyHost", host)
+                System.setProperty("https.proxyPort", port)
+            elif typ in ("socks", "socks5", "socks4", "socks4a"):
+                System.setProperty("socksProxyHost", host)
+                System.setProperty("socksProxyPort", port)
+        except Exception as e:
+            log(f"[{__id__}] apply proxy error: {e}")
+
+    def _cmd_exit(self, args, dialog_id):
+        if not args:
+            self._reply(dialog_id, ".exit add Name [type] host port | .exit list | .exit use N | .exit ping | .exit off")
+            return
+        sub = str(args[0]).lower()
+        items = self._load_json("exit_list", [])
+        if sub == "add":
+            if len(args) < 4:
+                self._reply(dialog_id, "Пример: .exit add Home socks5 127.0.0.1 1080")
+                return
+            name = str(args[1])
+            rest = args[2:]
+            typ = "socks5"
+            if rest and str(rest[0]).lower() in ("http", "https", "socks", "socks4", "socks4a", "socks5"):
+                typ = str(rest.pop(0)).lower()
+            if len(rest) < 2:
+                self._reply(dialog_id, "Нужны host и port.")
+                return
+            host = str(rest[0])
+            try:
+                port = int(rest[1])
+            except Exception:
+                self._reply(dialog_id, "Не понял порт.")
+                return
+            user = str(rest[2]) if len(rest) > 2 else ""
+            password = str(rest[3]) if len(rest) > 3 else ""
+            items.append({"name": name, "type": typ, "host": host, "port": port, "user": user, "password": password})
+            self._save_json("exit_list", items)
+            self._reply(dialog_id, f"Exit добавлен: #{len(items)} {name} {typ}://{host}:{port}")
+        elif sub == "list":
+            if not items:
+                self._reply(dialog_id, "Список exit пуст.")
+                return
+            lines = [f"#{i+1} {it.get('name')} {it.get('type')}://{it.get('host')}:{it.get('port')}" for i, it in enumerate(items)]
+            self._reply(dialog_id, "Exit list:\n" + "\n".join(lines))
+        elif sub == "use":
+            if len(args) < 2:
+                self._reply(dialog_id, "Пример: .exit use 1")
+                return
+            try:
+                idx = int(args[1]) - 1
+            except Exception:
+                self._reply(dialog_id, "Не понял номер.")
+                return
+            if idx < 0 or idx >= len(items):
+                self._reply(dialog_id, "Нет такого exit.")
+                return
+            it = items[idx]
+            cfg = {"enabled": True, "type": it.get("type", "socks5"), "host": it.get("host"), "port": it.get("port"), "user": it.get("user", ""), "password": it.get("password", "")}
+            self._save_json("proxy_cfg", cfg)
+            self._set_setting("proxy_enable", True)
+            self._cfg["proxy_enable"] = True
+            self._apply_proxy_settings()
+            self._reply(dialog_id, f"Используется exit #{idx+1}: {it.get('name')}")
+        elif sub == "ping":
+            if not items:
+                self._reply(dialog_id, "Нет exit для проверки.")
+                return
+
+            def worker():
+                results = []
+                for i, it in enumerate(items):
+                    ms = self._test_endpoint(str(it.get("host", "")), int(it.get("port", 0) or 0))
+                    results.append((i + 1, str(it.get("name", f"exit {i+1}")), ms))
+                finite = [r for r in results if r[2] is not None]
+                finite.sort(key=lambda x: x[2])
+                lines = ["Exit ping:"]
+                for num, name, ms in results:
+                    lines.append(f"#{num} {name}: {'timeout' if ms is None else f'{ms:.1f} ms'}")
+                if finite and self._cfg.get("exit_auto_use", False):
+                    best_num = finite[0][0]
+                    best = items[best_num - 1]
+                    cfg = {"enabled": True, "type": best.get("type", "socks5"), "host": best.get("host"), "port": best.get("port"), "user": best.get("user", ""), "password": best.get("password", "")}
+                    self._save_json("proxy_cfg", cfg)
+                    self._set_setting("proxy_enable", True)
+                    self._cfg["proxy_enable"] = True
+                    self._apply_proxy_settings()
+                    lines.append(f"Автовыбран: #{best_num} {best.get('name')}")
+                self._reply(dialog_id, "\n".join(lines))
+
+            t = Thread(target=worker)
+            t.daemon = True
+            t.start()
+        elif sub == "off":
+            cfg = self._load_json("proxy_cfg", {})
+            cfg["enabled"] = False
+            self._save_json("proxy_cfg", cfg)
+            self._set_setting("proxy_enable", False)
+            self._cfg["proxy_enable"] = False
+            self._apply_proxy_settings()
+            self._reply(dialog_id, "Proxy/exit выключен.")
+        else:
+            self._reply(dialog_id, "Подкоманды: add, list, use, ping, off")
+
+    def _test_endpoint(self, host, port, timeout_ms=2000):
+        if not host or not port:
+            return None
+        sock = Socket()
+        try:
+            t0 = time.monotonic()
+            sock.connect(InetSocketAddress(str(host), int(port)), int(timeout_ms))
+            return (time.monotonic() - t0) * 1000.0
+        except Exception:
+            return None
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _cmd_pass(self, args, dialog_id):
+        if not args:
+            self._reply(dialog_id, ".pass set **** | .pass off")
+            return
+        sub = str(args[0]).lower()
+        if sub == "set":
+            if len(args) < 2:
+                self._reply(dialog_id, "Пример: .pass set 1234")
+                return
+            secret = " ".join(args[1:])
+            self._set_setting("pass_hash", self._hash_secret(secret))
+            self._reply(dialog_id, "Пароль установлен. Не показывай этот чат.")
+        elif sub == "off":
+            self._set_setting("pass_hash", "")
+            self._reply(dialog_id, "Пароль очищен.")
+        else:
+            self._reply(dialog_id, "Подкоманды: set, off")
+
+    def _cmd_panic(self, args, dialog_id):
+        if not args:
+            self._reply(dialog_id, ".panic set **** | .panic off")
+            return
+        sub = str(args[0]).lower()
+        if sub == "set":
+            if len(args) < 2:
+                self._reply(dialog_id, "Пример: .panic set 0000")
+                return
+            secret = " ".join(args[1:])
+            self._set_setting("panic_hash", self._hash_secret(secret))
+            self._reply(dialog_id, "Паника-код установлен. Он очистит только данные плагина.")
+        elif sub == "off":
+            self._set_setting("panic_hash", "")
+            self._reply(dialog_id, "Паника-код очищен.")
+        else:
+            self._reply(dialog_id, "Подкоманды: set, off")
+
+    def _has_pass(self):
+        return bool(str(self.get_setting("pass_hash", "") or ""))
+
+    def _ensure_salt(self):
+        salt = str(self.get_setting("pass_salt", "") or "")
+        if not salt:
+            salt = hashlib.sha256(str(time.time()).encode("utf-8")).hexdigest()[:16]
+            self._set_setting("pass_salt", salt)
+        return salt
+
+    def _hash_secret(self, secret):
+        salt = self._ensure_salt()
+        return hashlib.sha256((salt + str(secret)).encode("utf-8")).hexdigest()
+
+    def _show_lock(self):
+        if not self._has_pass():
+            self._show_status("Сначала задай пароль: .pass set ****")
+            return
+        self._ensure_attached(force=True)
+        if self._decor is None or self._lock is not None:
+            return
+        ctx = self._current_activity()
+        if ctx is None:
+            return
+        dp = AndroidUtilities.dp
+        fl = FrameLayout(ctx)
+        fl.setBackgroundColor(as_java_color(0xE6000000))
+        fl.setClickable(True)
+        fl.setFocusable(True)
+        fl.setFocusableInTouchMode(True)
+
+        ll = LinearLayout(ctx)
+        ll.setOrientation(LinearLayout.VERTICAL)
+        ll.setGravity(Gravity.CENTER)
+        ll.setPadding(dp(24), dp(24), dp(24), dp(24))
+
+        title = TextView(ctx)
+        title.setText("🔒 Exter Suite")
+        title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20.0)
+        title.setTextColor(as_java_color(0xFFFFFFFF))
+        try:
+            title.setTypeface(AndroidUtilities.bold())
+        except Exception:
+            pass
+        ll.addView(title, LinearLayout.LayoutParams(-2, -2))
+
+        hint = TextView(ctx)
+        hint.setText("Введи код. Паника-код очистит данные плагина.")
+        hint.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.0)
+        hint.setTextColor(as_java_color(0xFFDDDDDD))
+        hint_lp = LinearLayout.LayoutParams(-2, -2)
+        hint_lp.setMargins(0, dp(8), 0, dp(12))
+        ll.addView(hint, hint_lp)
+
+        inp = EditText(ctx)
+        inp.setHint("Код")
+        inp.setInputType(129)
+        inp.setTextColor(as_java_color(0xFF000000))
+        inp.setBackgroundColor(as_java_color(0xFFFFFFFF))
+        inp.setPadding(dp(12), dp(10), dp(12), dp(10))
+        inp_lp = LinearLayout.LayoutParams(dp(220), -2)
+        ll.addView(inp, inp_lp)
+
+        btn = Button(ctx)
+        btn.setText("Разблокировать")
+        btn_lp = LinearLayout.LayoutParams(-2, -2)
+        btn_lp.setMargins(0, dp(12), 0, 0)
+        listener = _OnClickListener(self._try_unlock)
+        self._lock_listeners.append(listener)
+        btn.setOnClickListener(listener)
+        ll.addView(btn, btn_lp)
+
+        fl.addView(ll, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+        self._decor.addView(fl, FrameLayout.LayoutParams(-1, -1))
+        self._lock = fl
+        self._lock_input = inp
+        self._locked = True
+        self._wrong_unlocks = 0
+
+    def _hide_lock(self):
+        lock = self._lock
+        self._lock = None
+        self._lock_input = None
+        self._lock_listeners = []
+        self._locked = False
+        self._remove_view(lock)
+
+    def _try_unlock(self):
+        inp = self._lock_input
+        if inp is None:
+            return
+        secret = str(inp.getText()).strip()
+        if not secret:
+            return
+        pass_hash = str(self.get_setting("pass_hash", "") or "")
+        if not pass_hash:
+            self._hide_lock()
+            return
+        h = self._hash_secret(secret)
+        if h == pass_hash:
+            self._hide_lock()
+            self._show_status("Разблокировано.")
+            return
+        panic_hash = str(self.get_setting("panic_hash", "") or "")
+        if panic_hash and h == panic_hash and self._cfg.get("panic_enabled", True):
+            self._safe_wipe()
+            return
+        self._wrong_unlocks += 1
+        self._toast("Неверный код.")
+        try:
+            inp.setText("")
+        except Exception:
+            pass
+
+    def _safe_wipe(self):
+        self._hide_lock()
+        self._close_panel()
+        for key in WIPE_KEYS:
+            try:
+                self._set_setting(key, "")
+            except Exception:
+                pass
+        self._reload_cfg()
+        self._detach_views()
+        self._running = False
+        self._unloaded = True
+        if self._handler is not None and self._tick_r is not None:
+            self._handler.removeCallbacks(self._tick_r)
+        self._toast("Exter Suite: локальные данные очищены.")
+
+    def _strip_params(self, params):
+        if ExifInterface is None or not EXIF_TAGS:
+            return
+        attrs = (
+            "photoPath", "photoPaths", "documentPath", "mediaPath",
+            "path", "filePaths", "videoPath", "voicePath",
+        )
+        for attr in attrs:
+            try:
+                value = getattr(params, attr, None)
+            except Exception:
+                value = None
+            if value is None:
+                continue
+            for p in self._iter_paths(value):
+                if not p:
+                    continue
+                low = p.lower()
+                if low.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                    self._strip_image_file(p)
+
+    def _iter_paths(self, value):
+        if value is None:
+            return
+        if isinstance(value, str):
+            yield value
+            return
+        try:
+            n = len(value)
+            for i in range(n):
+                yield str(value[i])
+            return
+        except Exception:
+            pass
+        try:
+            n = int(value.size())
+            for i in range(n):
+                yield str(value.get(i))
+            return
+        except Exception:
+            pass
+        try:
+            yield str(value)
+        except Exception:
+            pass
+
+    def _strip_image_file(self, path):
+        try:
+            f = File(path)
+            if not f.exists():
+                return
+            exif = ExifInterface(path)
+            for tag in EXIF_TAGS:
+                try:
+                    exif.setAttribute(tag, None)
+                except Exception:
+                    try:
+                        exif.setAttribute(tag, "")
+                    except Exception:
+                        pass
+            exif.saveAttributes()
+        except Exception as e:
+            log(f"[{__id__}] strip exif error: {e}")
+
+    def _action_ping(self):
+        self._cmd_ping([], self._current_dialog_id())
+
+    def _action_currency(self):
+        self._cmd_cr(["1", self._cfg.get("currency_from", "USD"), self._cfg.get("currency_to", "RUB")], self._current_dialog_id())
+
+    def _action_timers(self):
+        self._cmd_timers(self._current_dialog_id())
+
+    def _action_birthdays(self):
+        self._cmd_bday(["list"], self._current_dialog_id())
+
+    def _action_export(self):
+        fmt = ["html", "json", "txt"][clamp(int(self._cfg.get("export_idx", 0)), 0, 2)]
+        self._action_export_format(fmt)
+
+    def _action_export_format(self, fmt):
+        self._cmd_export([fmt], self._current_dialog_id())
+
+    def _action_scan_saved(self):
+        self._cmd_cleansaved([], self._current_dialog_id())
+
+    def _action_delete_dupes(self):
+        self._cmd_cleansaved(["delete"], self._current_dialog_id())
+
+    def _action_read_all(self):
+        self._cmd_readall(self._current_dialog_id())
+
+    def _action_toggle_autoplay(self):
+        self._cmd_autoplay([], self._current_dialog_id())
+
+    def _action_toggle_endless(self):
+        self._cmd_endless([], self._current_dialog_id())
+
+    def _action_lock(self):
+        self._show_lock()
+
+    def _action_proxy_status(self):
+        self._cmd_proxy(["status"], self._current_dialog_id())
+
+    def _action_help(self):
+        self._open_panel()
+        if self._panel_log is not None:
+            self._panel_log.setText(HELP_TEXT)
+        else:
+            self._show_status(HELP_TEXT)
+
+    def _call_method(self, obj, names, *args):
+        if obj is None:
+            return None
+        for name in names:
+            try:
+                fn = getattr(obj, name, None)
+                if fn is None:
+                    continue
+                return fn(*args)
+            except Exception:
+                continue
+        return None
+
+    def _get_attr(self, obj, names):
+        if obj is None:
+            return None
+        for name in names:
+            try:
+                value = getattr(obj, name, None)
+                if value is not None:
+                    return value
+            except Exception:
+                continue
+        return None
+
+    def _try_call(self, obj, names, *args):
+        if obj is None:
+            return False
+        for name in names:
+            try:
+                fn = getattr(obj, name, None)
+                if fn is None:
+                    continue
+                fn(*args)
+                return True
+            except Exception:
+                try:
+                    fn = getattr(obj, name, None)
+                    if fn is not None:
+                        fn()
+                        return True
+                except Exception:
+                    pass
+        return False
